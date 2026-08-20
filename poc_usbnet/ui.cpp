@@ -2333,6 +2333,42 @@ void setGravityY(float g) {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic reset banner (raw Arduino_GFX; called before lv_init())
+// ---------------------------------------------------------------------------
+// Deliberately plain: this runs during a suspected-crash post-mortem, so
+// legibility beats aesthetics. Amber-on-black in the big built-in font.
+void showResetBanner(Arduino_GFX* gfx, const char* reason, uint32_t uptime_ms) {
+  if (!gfx || !reason) return;
+  gfx->fillScreen(0x0000);
+  const uint16_t amber = 0xFC00;  // RGB565 orange/amber
+  const uint16_t dim   = 0xC618;  // RGB565 light grey
+
+  gfx->setTextColor(dim);
+  gfx->setTextSize(2);
+  gfx->setCursor(20, 60);
+  gfx->print("LAST RESET:");
+
+  gfx->setTextColor(amber);
+  gfx->setTextSize(4);
+  gfx->setCursor(20, 100);
+  gfx->print(reason);
+
+  gfx->setTextColor(dim);
+  gfx->setTextSize(2);
+  gfx->setCursor(20, 200);
+  gfx->print("uptime before reset:");
+  gfx->setTextSize(3);
+  gfx->setTextColor(0xFFFF);
+  gfx->setCursor(20, 230);
+  if (uptime_ms == 0) {
+    gfx->print("(unknown)");
+  } else {
+    gfx->print(uptime_ms / 1000);
+    gfx->print("s");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot splash
 // ---------------------------------------------------------------------------
 void showSplash() {
@@ -2373,16 +2409,27 @@ void showSplash() {
   lv_obj_set_style_opa(img, LV_OPA_TRANSP, 0);
   lv_obj_set_style_opa(name, LV_OPA_TRANSP, 0);
   lv_obj_set_style_opa(sub, LV_OPA_TRANSP, 0);
+  // Splash is intentionally left blocking-with-yield instead of a full state
+  // machine (reboot-diagnostics patch, 2026-08). Rationale: usbnet::begin()
+  // runs AFTER showSplash(), so no USB task is starved during the fade; and
+  // delay(16) on ESP32 calls vTaskDelay(), which yields to FreeRTOS and
+  // resets the task watchdog. The explicit yield() below is defence-in-depth
+  // for any future addition that lands network/USB service before the splash.
   for (int i = 0; i <= 32; ++i) {
     lv_opa_t o = (lv_opa_t)(i * 8 > 255 ? 255 : i * 8);
     lv_obj_set_style_opa(img, o, 0);
     if (i > 8) lv_obj_set_style_opa(name, o, 0);
     if (i > 16) lv_obj_set_style_opa(sub, o, 0);
     lv_timer_handler();
+    yield();
     delay(16);
   }
   uint32_t t0 = millis();
-  while (millis() - t0 < 1600) { lv_timer_handler(); delay(16); }
+  while (millis() - t0 < 1600) {
+    lv_timer_handler();
+    yield();
+    delay(16);
+  }
   if (keystore::locked()) {
     buildPinPad("Enter PIN", 0);
   } else {

@@ -51,6 +51,11 @@ void buttonLong();
 void toggleByteSwap();  // serial 'W': flip RGB565 byte order if colors look off
 
 // --- rotation / boot ---------------------------------------------------------
+// Diagnostic banner drawn with the raw Arduino_GFX API BEFORE lv_init().
+// Called by the sketch when the previous boot ended in something other
+// than a clean power-on. `reason` is a short human string ("TASK_WDT",
+// "PANIC", etc.); `uptime_ms` is how long the previous boot lived.
+void showResetBanner(Arduino_GFX* gfx, const char* reason, uint32_t uptime_ms);
 // Boot splash: logo mark + name, shown before the home screen.
 void showSplash();
 // Apply a rotation mode. For ROT_AUTO the sketch feeds gravity via setGravityY.

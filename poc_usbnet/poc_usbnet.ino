@@ -1,5 +1,19 @@
 // poc_usbnet — USB-C plug-in Nostr signer.
 //
+// Reboot-diagnostics patch (2026-08): the device was rebooting silently every
+// couple of minutes. This file grew:
+//   - esp_reset_reason() logging at the top of setup() (plus one-shot AMOLED
+//     banner if the last boot wasn't a cold power-on)
+//   - RTC_NOINIT_ATTR uptime capture, refreshed every 1s in loop(), so the
+//     next boot can report "we ran for Xs before dying"
+//   - periodic [HEAP] and [WDT] log lines (see loop())
+//   - yield() sprinkled through loop() so no single handler starves the TWDT
+// The splash was left blocking-with-yield rather than converted to a state
+// machine: showSplash() already calls delay(16) between LVGL ticks (which
+// yields on ESP32), and it runs before usbnet::begin(), so it never blocks
+// USB service. Chose option (b) — smaller diff, smaller regression surface.
+// See docs/firmware-reboot-hunt.md for how to read the new log lines.
+//
 // Transport: enumerates as a USB CDC-ECM network adapter (native on iOS,
 // macOS, Linux, Android). Host gets 10.77.7.x over the cable and reaches a
 // NIP-07-shaped HTTP API at http://10.77.7.1:
@@ -29,6 +43,9 @@
 #include <USB.h>
 #include <SD_MMC.h>
 #include <mbedtls/base64.h>
+#include <esp_system.h>       // esp_reset_reason()
+#include <esp_heap_caps.h>    // heap_caps_get_free_size for internal heap
+#include <esp_attr.h>         // RTC_NOINIT_ATTR
 
 #include <Arduino_GFX_Library.h>
 #include <SensorQMI8658.hpp>
@@ -52,6 +69,42 @@
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 #define BTN_PIN 0  // BOOT side button
+
+// ---------------------------------------------------------------------------
+// Reboot diagnostics (see docs/firmware-reboot-hunt.md)
+// ---------------------------------------------------------------------------
+// Preserved across resets (but *not* across power-cycle) so the next boot
+// can report "we ran for X ms before we died". `sentinel` is set to a magic
+// value once we've written a valid uptime, and cleared as soon as we read it.
+static const uint32_t kUptimeSentinel = 0xDEADBEEFu;
+RTC_NOINIT_ATTR uint32_t g_lastUptimeMs;
+RTC_NOINIT_ATTR uint32_t g_lastUptimeSentinel;
+
+// Reset cause of the *current* boot, captured at the very top of setup().
+static esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;
+// Uptime that the previous boot ran for, in ms (0 = unknown/cold-boot).
+static uint32_t g_prevUptimeMs = 0;
+
+// Max ms observed between two consecutive loop() iterations since boot.
+// Surfaced in the periodic [HEAP] line as `slowLoopMax`.
+static uint32_t g_slowLoopMaxMs = 0;
+
+static const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWER_ON";
+    case ESP_RST_EXT:       return "EXTERNAL";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "OTHER_WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_UNKNOWN:
+    default:                return "UNKNOWN";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Display + touch (same V2 board bring-up as mini_screen)
@@ -1152,6 +1205,23 @@ static void processSerial() {
 void setup() {
   Serial.begin(115200);
   delay(50);
+
+  // --- Reboot diagnostics: MUST run before any real hardware bring-up so
+  // the reason of the *previous* death is captured even if the current boot
+  // is about to die again during init. See docs/firmware-reboot-hunt.md.
+  g_resetReason = esp_reset_reason();
+  if (g_lastUptimeSentinel == kUptimeSentinel) {
+    g_prevUptimeMs = g_lastUptimeMs;
+  } else {
+    g_prevUptimeMs = 0;  // cold boot, or RTC contents corrupted
+  }
+  // Invalidate immediately so a subsequent boot without a fresh uptime write
+  // (e.g. instant crash before we reach loop()) does not read a stale value.
+  g_lastUptimeSentinel = 0;
+  Serial.printf("[boot] reset_reason=%d (%s)  prev_uptime_ms=%lu\n",
+                (int)g_resetReason, resetReasonStr(g_resetReason),
+                (unsigned long)g_prevUptimeMs);
+
   Serial.println("[poc] usb-net signer boot (ECM + BIP-340 + LVGL watch UI)");
 
   pinMode(BTN_PIN, INPUT_PULLUP);
@@ -1168,6 +1238,16 @@ void setup() {
   gfx->begin();
   gfx->fillScreen(0x0000);
   gfx->setBrightness(255);
+
+  // If the last boot ended in something other than a clean power-on, hold
+  // the reset reason on the AMOLED for 3s so a human watching the device
+  // catches it even without a serial cable. Drawn with the raw Arduino_GFX
+  // API — this runs before lv_init(), so LVGL isn't available yet.
+  if (g_resetReason != ESP_RST_POWERON) {
+    ui::showResetBanner(gfx, resetReasonStr(g_resetReason), g_prevUptimeMs);
+    delay(3000);
+    gfx->fillScreen(0x0000);
+  }
 
   for (int tries = 0; tries < 5 && !touch_ok; ++tries) {
     if (CST->begin()) { touch_ok = true; break; }
@@ -1258,12 +1338,55 @@ void setup() {
 }
 
 void loop() {
+  // Reboot diagnostics: measure how long the *previous* iteration took to
+  // return. If it approached the 5s TASK_WDT_TIMEOUT_S we want a paper trail
+  // pointing at the offending sub-call, so this runs FIRST before any real
+  // work in the current iteration.
+  static uint32_t s_lastIterMs = 0;
+  const uint32_t iter_now = millis();
+  if (s_lastIterMs != 0) {
+    const uint32_t iter_dt = iter_now - s_lastIterMs;
+    if (iter_dt > g_slowLoopMaxMs) g_slowLoopMaxMs = iter_dt;
+    if (iter_dt > 3000) {
+      Serial.printf("[WDT] slow loop iter: %lums\n", (unsigned long)iter_dt);
+    }
+  }
+  s_lastIterMs = iter_now;
+
+  yield();
   usbnet::tick();
+  yield();
   server.handleClient();
+  yield();
   pollButton();
   processSerial();
 
   const uint32_t now = millis();
+
+  // Uptime capture: refresh once per second so the RTC-preserved value is
+  // never more than ~1s stale. Sentinel is only set once we have a real
+  // value; setup() checks it and invalidates so a crash during init won't
+  // resurface a stale uptime.
+  static uint32_t s_uptime_t = 0;
+  if (now - s_uptime_t >= 1000) {
+    s_uptime_t = now;
+    g_lastUptimeMs = now;
+    g_lastUptimeSentinel = kUptimeSentinel;
+  }
+
+  // Periodic health snapshot. Grep-friendly single line: `[HEAP]`.
+  static uint32_t s_heap_t = 0;
+  if (now - s_heap_t >= 5000) {
+    s_heap_t = now;
+    const uint32_t free_heap = ESP.getFreeHeap();
+    const uint32_t min_heap  = ESP.getMinFreeHeap();
+    const uint32_t internal  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    Serial.printf("[HEAP] free=%lu min=%lu internal=%lu slowLoopMax=%lums "
+                  "uptime=%lus reset=%s\n",
+                  (unsigned long)free_heap, (unsigned long)min_heap,
+                  (unsigned long)internal, (unsigned long)g_slowLoopMaxMs,
+                  (unsigned long)(now / 1000), resetReasonStr(g_resetReason));
+  }
 
   // Expire pending requests nobody acted on (extension gives up at ~3 min).
   for (int i = 0; i < QLEN; ++i) {
@@ -1321,5 +1444,6 @@ void loop() {
   if (!cur && g_pstate == PS_PENDING && !g_ptx_shown) psbtPrompt();
 
   ui::tick();
+  yield();
   delay(2);
 }
