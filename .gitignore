@@ -1,0 +1,11 @@
+# Build output lives in ../tools — never in-repo
+build*/
+*.bin
+*.elf
+*.map
+# Never commit key material. The device imports keys from SD card only.
+nostr-keys.json
+nostr-keys.txt
+*.psbt
+secrets/
+.DS_Store
