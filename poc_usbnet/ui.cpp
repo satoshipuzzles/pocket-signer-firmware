@@ -16,6 +16,7 @@
 #include "bech32.h"
 #include "taproot.h"
 #include "bip39.h"
+#include "logo_img.h"
 #include "mbedtls/sha256.h"
 
 namespace ui {
@@ -2336,46 +2337,56 @@ void setGravityY(float g) {
 // ---------------------------------------------------------------------------
 void showSplash() {
   lv_obj_t* s = makeScreen();
-  // Placeholder mark until the final logo lands: a coin-and-bolt motif in the
-  // brand's colors (orange disc + purple bolt), matching the nostrtx icon.
-  lv_obj_t* disc = plainCont(s);
-  lv_obj_set_size(disc, 110, 110);
-  lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(disc, lv_color_hex(0xF7931A), 0);
-  lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
-  lv_obj_align(disc, LV_ALIGN_CENTER, -14, -60);
-  lv_obj_t* b = lv_label_create(disc);
-  lv_label_set_text(b, "B");
-  lv_obj_set_style_text_font(b, &lv_font_montserrat_44, 0);
-  lv_obj_set_style_text_color(b, lv_color_hex(0x000000), 0);
-  lv_obj_center(b);
-  lv_obj_t* bolt = lv_label_create(s);
-  lv_label_set_text(bolt, LV_SYMBOL_CHARGE);
-  lv_obj_set_style_text_font(bolt, &lv_font_montserrat_44, 0);
-  lv_obj_set_style_text_color(bolt, lv_color_hex(0xBF5AF2), 0);
-  lv_obj_align(bolt, LV_ALIGN_CENTER, 52, -60);
+
+  // The real brand mark (nostrtx icon), embedded as RGB565.
+  static lv_image_dsc_t logo_dsc;
+  memset(&logo_dsc, 0, sizeof(logo_dsc));
+  logo_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+  logo_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+  logo_dsc.header.w = LOGO_W;
+  logo_dsc.header.h = LOGO_H;
+  logo_dsc.header.stride = LOGO_W * 2;
+  logo_dsc.data_size = sizeof(LOGO_PX);
+  logo_dsc.data = (const uint8_t*)LOGO_PX;
+
+  lv_obj_t* img = lv_image_create(s);
+  lv_image_set_src(img, &logo_dsc);
+  lv_obj_align(img, LV_ALIGN_CENTER, 0, -52);
+  lv_obj_set_style_radius(img, 28, 0);
+  lv_obj_set_style_clip_corner(img, true, 0);
 
   lv_obj_t* name = lv_label_create(s);
   lv_label_set_text(name, "Nostr Onchain");
   lv_obj_set_style_text_font(name, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(name, C_TEXT, 0);
-  lv_obj_align(name, LV_ALIGN_CENTER, 0, 28);
+  lv_obj_align(name, LV_ALIGN_CENTER, 0, 66);
 
   lv_obj_t* sub = lv_label_create(s);
   lv_label_set_text(sub, "Pocket Signer");
   lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(sub, C_DIM, 0);
-  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 60);
+  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 100);
 
   lv_screen_load(s);
-  // Render it now (init() runs before the main loop starts ticking LVGL),
-  // hold briefly, then fall through to unlock (PIN set) or home.
-  for (int i = 0; i < 30; ++i) { lv_timer_handler(); delay(16); }
-  delay(600);
+  // Render now (init() runs before the main loop ticks LVGL). Fade the logo
+  // in over ~0.5s, hold ~1.6s: a confident boot, not a slideshow.
+  lv_obj_set_style_opa(img, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_opa(name, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_opa(sub, LV_OPA_TRANSP, 0);
+  for (int i = 0; i <= 32; ++i) {
+    lv_opa_t o = (lv_opa_t)(i * 8 > 255 ? 255 : i * 8);
+    lv_obj_set_style_opa(img, o, 0);
+    if (i > 8) lv_obj_set_style_opa(name, o, 0);
+    if (i > 16) lv_obj_set_style_opa(sub, o, 0);
+    lv_timer_handler();
+    delay(16);
+  }
+  uint32_t t0 = millis();
+  while (millis() - t0 < 1600) { lv_timer_handler(); delay(16); }
   if (keystore::locked()) {
     buildPinPad("Enter PIN", 0);
   } else {
-    lv_screen_load_anim(scr_home, LV_SCR_LOAD_ANIM_FADE_IN, 350, 0, true);
+    lv_screen_load_anim(scr_home, LV_SCR_LOAD_ANIM_FADE_IN, 400, 0, true);
   }
 }
 

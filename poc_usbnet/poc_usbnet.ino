@@ -1075,6 +1075,43 @@ static void processSerial() {
                     (unsigned long)ecm_report_attempts,
                     (unsigned long)ecm_report_sends, pendingCount(),
                     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    } else if (c == 'P') {
+      // Sign an arbitrary event with a chosen slot: P<idx>:<event-json>\n
+      // The event json must carry kind/created_at/tags/content. Signed result
+      // is printed as a complete Nostr event. Key never leaves the device.
+      String line = Serial.readStringUntil('\n');
+      int colon = line.indexOf(':');
+      if (colon <= 0) { Serial.println("[psign] usage P<idx>:<json>"); continue; }
+      int idx = line.substring(0, colon).toInt();
+      String json = line.substring(colon + 1);
+      uint8_t priv[32];
+      if (!keystore::privOf(idx, priv)) { Serial.println("[psign] bad slot / locked"); continue; }
+      JsonDocument src;
+      if (deserializeJson(src, json)) { memset(priv, 0, 32); Serial.println("[psign] bad json"); continue; }
+      const String pub_hex = keystore::pubHexOf(idx);
+      uint32_t created_at = src["created_at"] | 0;
+      int kind = src["kind"] | 1;
+      JsonDocument arr;
+      JsonArray a = arr.to<JsonArray>();
+      a.add(0); a.add(pub_hex); a.add(created_at); a.add(kind);
+      if (src["tags"].is<JsonArray>()) a.add(src["tags"]); else a.add(JsonArray());
+      a.add(src["content"] | "");
+      String ser; serializeJson(arr, ser);
+      uint8_t id[32], sig[64];
+      bip340::sha256((const uint8_t*)ser.c_str(), ser.length(), id);
+      bool ok = bip340::sign(priv, id, sig);
+      memset(priv, 0, 32);
+      if (!ok) { Serial.println("[psign] sign failed"); continue; }
+      JsonDocument out;
+      out["id"] = hexOf(id, 32);
+      out["pubkey"] = pub_hex;
+      out["created_at"] = created_at;
+      out["kind"] = kind;
+      out["tags"] = src["tags"].is<JsonArray>() ? src["tags"] : JsonArray();
+      out["content"] = src["content"] | "";
+      out["sig"] = hexOf(sig, 64);
+      String o; serializeJson(out, o);
+      Serial.println("[psign] " + o);
     } else if (c == 'N') {
       int r = keystore::generateKey("key " + String(keystore::count() + 1));
       Serial.printf("[accounts] generateKey -> %d\n", r);
