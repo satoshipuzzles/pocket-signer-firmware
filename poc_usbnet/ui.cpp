@@ -15,6 +15,8 @@
 #include "profile.h"
 #include "bech32.h"
 #include "taproot.h"
+#include "bip39.h"
+#include "mbedtls/sha256.h"
 
 namespace ui {
 
@@ -43,6 +45,7 @@ static bool g_auto_auth = true;
 static bool g_swap = false;
 
 static lv_obj_t* scr_home = nullptr;
+static lv_obj_t* scr_settings = nullptr;
 static lv_obj_t* scr_accounts = nullptr;
 static lv_obj_t* scr_request = nullptr;
 static lv_obj_t* scr_result = nullptr;
@@ -86,11 +89,25 @@ static lv_obj_t* g_prof_back_to = nullptr; // screen to return to
 // ---------------------------------------------------------------------------
 // Display + touch drivers
 // ---------------------------------------------------------------------------
+// 180° rotation so the USB-C/button edge can be "up" (male-male dock use).
+// LVGL renders unrotated; we reverse the pixel block and mirror its position.
+// Touch coordinates are mirrored in pollTouchHW.
+bool g_rot180 = false;
+
 static void flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
   const int32_t w = area->x2 - area->x1 + 1;
   const int32_t h = area->y2 - area->y1 + 1;
   if (g_swap) lv_draw_sw_rgb565_swap(px_map, w * h);
-  g_gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t*)px_map, w, h);
+  if (g_rot180) {
+    uint16_t* px = (uint16_t*)px_map;
+    for (int32_t i = 0, j = w * h - 1; i < j; ++i, --j) {
+      uint16_t t = px[i]; px[i] = px[j]; px[j] = t;
+    }
+    g_gfx->draw16bitRGBBitmap(LCD_WIDTH - 1 - area->x2, LCD_HEIGHT - 1 - area->y2,
+                              px, w, h);
+  } else {
+    g_gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t*)px_map, w, h);
+  }
   lv_display_flush_ready(disp);
 }
 
@@ -118,6 +135,7 @@ static void pollTouchHW() {
       int16_t y = (int16_t)g_touch->IIC_Read_Device_Value(
           Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
       if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
+        if (g_rot180) { x = LCD_WIDTH - 1 - x; y = LCD_HEIGHT - 1 - y; }
         if (tp_events == 0) tp_first = now;
         tp_events++;
         tp_x = x;
@@ -376,6 +394,15 @@ static void gotoHome() {
   lv_screen_load_anim(scr_home, LV_SCR_LOAD_ANIM_OVER_RIGHT, 220, 0, false);
 }
 
+static void buildSettings();
+static void showBackup(int idx);
+static void buildDice();
+static void buildPinPad(const char* title, uint8_t mode);
+static void gotoSettings() {
+  buildSettings();
+  lv_screen_load_anim(scr_settings, LV_SCR_LOAD_ANIM_OVER_LEFT, 220, 0, false);
+}
+
 static void gotoFollows() {
   if (g_follows_stale) buildFollows();
   lv_screen_load_anim(scr_follows, LV_SCR_LOAD_ANIM_OVER_LEFT, 220, 0, false);
@@ -388,7 +415,7 @@ static lv_obj_t* menuRow(lv_obj_t* parent, int y, const char* symbol,
                          const char* text, const char* detail,
                          lv_event_cb_t cb) {
   lv_obj_t* row = lv_obj_create(parent);
-  lv_obj_set_size(row, LCD_WIDTH - 28, 58);
+  lv_obj_set_size(row, LCD_WIDTH - 28, 52);
   lv_obj_set_pos(row, 14, y);
   lv_obj_set_style_radius(row, 18, 0);
   lv_obj_set_style_bg_color(row, C_CARD, 0);
@@ -450,11 +477,11 @@ static void buildHome() {
   lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_border_width(ring, 3, 0);
   lv_obj_set_style_border_color(ring, g_link ? C_GREEN : C_CARD_HI, 0);
-  lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 16);
+  lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 8);
 
   if (count > 0) {
     lv_obj_t* av = makeAvatar(s, active, 98);
-    lv_obj_align(av, LV_ALIGN_TOP_MID, 0, 25);
+    lv_obj_align(av, LV_ALIGN_TOP_MID, 0, 17);
 
     lv_obj_t* name = lv_label_create(s);
     lv_label_set_text(name, displayName(active).c_str());
@@ -463,14 +490,14 @@ static void buildHome() {
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_obj_set_width(name, LCD_WIDTH - 48);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 128);
 
     String np = keystore::npubOf(active);
     lv_obj_t* npub = lv_label_create(s);
     lv_label_set_text(npub, (np.substring(0, 14) + "..." + np.substring(np.length() - 4)).c_str());
     lv_obj_set_style_text_font(npub, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(npub, C_DIM, 0);
-    lv_obj_align(npub, LV_ALIGN_TOP_MID, 0, 172);
+    lv_obj_align(npub, LV_ALIGN_TOP_MID, 0, 160);
   } else {
     lv_obj_t* q = lv_label_create(s);
     lv_label_set_text(q, "?");
@@ -481,7 +508,7 @@ static void buildHome() {
     lv_label_set_text(name, "No keys");
     lv_obj_set_style_text_font(name, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(name, C_TEXT, 0);
-    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 128);
   }
 
   // Status line: dot + text (link state + reach)
@@ -491,7 +518,7 @@ static void buildHome() {
   lv_obj_set_flex_align(st, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(st, 7, 0);
-  lv_obj_align(st, LV_ALIGN_TOP_MID, 0, 196);
+  lv_obj_align(st, LV_ALIGN_TOP_MID, 0, 186);
   lv_obj_t* dot = plainCont(st);
   lv_obj_set_size(dot, 9, 9);
   lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
@@ -506,15 +533,18 @@ static void buildHome() {
 
   // Big tappable menu rows
   String accd = String(count);
-  menuRow(s, 234, LV_SYMBOL_SETTINGS, C_BLUE, 0x10263F,
+  menuRow(s, 222, LV_SYMBOL_DIRECTORY, C_BLUE, 0x10263F,
           "Accounts", accd.c_str(),
           [](lv_event_t*) { gotoAccounts(); });
-  menuRow(s, 298, LV_SYMBOL_EYE_OPEN, C_TEAL, 0x0C2B38,
+  menuRow(s, 278, LV_SYMBOL_EYE_OPEN, C_TEAL, 0x0C2B38,
           "Following", nullptr,
           [](lv_event_t*) { gotoFollows(); });
-  menuRow(s, 362, LV_SYMBOL_SD_CARD, C_AMBER, 0x3B2A0A,
+  menuRow(s, 334, LV_SYMBOL_SD_CARD, C_AMBER, 0x3B2A0A,
           "Sign PSBT from SD", nullptr,
           [](lv_event_t*) { if (g_cb.signPsbtSD) g_cb.signPsbtSD(); });
+  menuRow(s, 390, LV_SYMBOL_SETTINGS, C_DIM, 0x2C2C2E,
+          "Settings", nullptr,
+          [](lv_event_t*) { gotoSettings(); });
 
   g_home_stale = false;
 }
@@ -653,14 +683,60 @@ static void buildAccounts() {
     switch (b) {
       case 0:
         cb = [](lv_event_t*) {
-          int r = keystore::generateKey("key " + String(keystore::count() + 1));
-          if (r >= 0) {
-            toast("Created key " + String(r + 1), 0x0E3A20);
-            buildAccountRows();
-            g_home_stale = true;
-          } else {
-            toast(r == -4 ? "Store full (8 max)" : "Failed", 0x59201C);
-          }
+          // Chooser: instant hardware entropy, or the verifiable dice ceremony.
+          if (g_modal) return;
+          g_modal = lv_obj_create(lv_layer_top());
+          lv_obj_set_size(g_modal, LCD_WIDTH, LCD_HEIGHT);
+          lv_obj_set_pos(g_modal, 0, 0);
+          lv_obj_set_style_bg_color(g_modal, C_BG, 0);
+          lv_obj_set_style_bg_opa(g_modal, LV_OPA_70, 0);
+          lv_obj_set_style_border_width(g_modal, 0, 0);
+          lv_obj_clear_flag(g_modal, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_t* card = lv_obj_create(g_modal);
+          lv_obj_set_size(card, LCD_WIDTH - 56, LV_SIZE_CONTENT);
+          lv_obj_set_style_radius(card, 24, 0);
+          lv_obj_set_style_bg_color(card, C_CARD, 0);
+          lv_obj_set_style_border_width(card, 0, 0);
+          lv_obj_set_style_pad_all(card, 20, 0);
+          lv_obj_center(card);
+          lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+          lv_obj_set_style_pad_row(card, 10, 0);
+          lv_obj_t* t = lv_label_create(card);
+          lv_label_set_text(t, "New key");
+          lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+          lv_obj_set_style_text_color(t, C_TEXT, 0);
+          auto opt = [&](const char* txt, lv_event_cb_t ocb) {
+            lv_obj_t* b = lv_button_create(card);
+            lv_obj_set_size(b, lv_pct(100), 52);
+            lv_obj_set_style_radius(b, 18, 0);
+            lv_obj_set_style_bg_color(b, C_CARD_HI, 0);
+            lv_obj_set_style_shadow_width(b, 0, 0);
+            lv_obj_t* l = lv_label_create(b);
+            lv_label_set_text(l, txt);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(l, C_TEXT, 0);
+            lv_obj_center(l);
+            lv_obj_add_event_cb(b, ocb, LV_EVENT_CLICKED, NULL);
+          };
+          opt("Hardware random (instant)", [](lv_event_t*) {
+            lv_obj_delete(g_modal); g_modal = nullptr;
+            int r = keystore::generateKey("key " + String(keystore::count() + 1));
+            if (r >= 0) {
+              toast("Created key " + String(r + 1), 0x0E3A20);
+              buildAccountRows();
+              g_home_stale = true;
+            } else {
+              toast(r == -4 ? "Store full (8 max)" : "Failed", 0x59201C);
+            }
+          });
+          opt("Dice rolls (verifiable)", [](lv_event_t*) {
+            lv_obj_delete(g_modal); g_modal = nullptr;
+            buildDice();
+          });
+          opt("Cancel", [](lv_event_t*) {
+            lv_obj_delete(g_modal); g_modal = nullptr;
+          });
         };
         break;
       case 1: cb = [](lv_event_t*) { if (g_cb.importSD) g_cb.importSD(); }; break;
@@ -722,14 +798,34 @@ static void openDeleteModal(int idx) {
   makeAvatar(card, idx, 56);
 
   lv_obj_t* t = lv_label_create(card);
-  lv_label_set_text(t, ("Delete \"" + displayName(idx) + "\"?").c_str());
+  lv_label_set_text(t, ("\"" + displayName(idx) + "\"").c_str());
   lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(t, C_TEXT, 0);
 
   lv_obj_t* w = lv_label_create(card);
-  lv_label_set_text(w, "This cannot be undone");
+  lv_label_set_text(w, "Back up the key, or delete it");
   lv_obj_set_style_text_font(w, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(w, C_DIM, 0);
+
+  // Backup: 24-word mnemonic on-screen (never leaves the device)
+  lv_obj_t* bkp = lv_button_create(card);
+  lv_obj_set_size(bkp, lv_pct(100), 48);
+  lv_obj_set_style_radius(bkp, 24, 0);
+  lv_obj_set_style_bg_color(bkp, C_CARD_HI, 0);
+  lv_obj_set_style_shadow_width(bkp, 0, 0);
+  lv_obj_t* bl = lv_label_create(bkp);
+  lv_label_set_text(bl, "Backup - show 24 words");
+  lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(bl, C_TEXT, 0);
+  lv_obj_center(bl);
+  lv_obj_add_event_cb(bkp,
+      [](lv_event_t* e) {
+        int idx = (int)(intptr_t)lv_event_get_user_data(e);
+        lv_obj_delete(g_modal);
+        g_modal = nullptr;
+        showBackup(idx);
+      },
+      LV_EVENT_CLICKED, (void*)(intptr_t)idx);
 
   lv_obj_t* rowb = plainCont(card);
   lv_obj_set_size(rowb, lv_pct(100), LV_SIZE_CONTENT);
@@ -1651,6 +1747,638 @@ void toggleByteSwap() {
   Serial.printf("[ui] rgb565 byte swap: %s\n", g_swap ? "ON" : "OFF");
 }
 
+// ---------------------------------------------------------------------------
+// PIN pad (lock screen + set-PIN flow)
+// ---------------------------------------------------------------------------
+static lv_obj_t* g_pin_scr = nullptr;
+static lv_obj_t* g_pin_dots = nullptr;
+static lv_obj_t* g_pin_title = nullptr;
+static String g_pin_buf;
+static String g_pin_first;     // first entry during set-PIN confirm step
+static uint8_t g_pin_mode = 0; // 0=unlock 1=set(enter) 2=set(confirm)
+
+static void pinUpdateDots() {
+  String d;
+  for (uint8_t i = 0; i < 8; ++i) {
+    if (i < g_pin_buf.length()) d += "* ";
+    else if (i < 4) d += "_ ";
+  }
+  lv_label_set_text(g_pin_dots, d.c_str());
+}
+
+static void pinDone();
+
+static void pinKey(lv_event_t* e) {
+  const int k = (int)(uintptr_t)lv_event_get_user_data(e);
+  if (k == -1) {  // backspace
+    if (g_pin_buf.length()) g_pin_buf.remove(g_pin_buf.length() - 1);
+  } else if (k == -2) {  // OK
+    if (g_pin_buf.length() >= 4) pinDone();
+    return;
+  } else if (g_pin_buf.length() < 8) {
+    g_pin_buf += (char)('0' + k);
+  }
+  pinUpdateDots();
+}
+
+static void buildPinPad(const char* title, uint8_t mode) {
+  g_pin_mode = mode;
+  g_pin_buf = "";
+  if (!g_pin_scr) g_pin_scr = makeScreen();
+  lv_obj_clean(g_pin_scr);
+
+  g_pin_title = lv_label_create(g_pin_scr);
+  lv_label_set_text(g_pin_title, title);
+  lv_obj_set_style_text_font(g_pin_title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(g_pin_title, C_TEXT, 0);
+  lv_obj_align(g_pin_title, LV_ALIGN_TOP_MID, 0, 18);
+
+  g_pin_dots = lv_label_create(g_pin_scr);
+  lv_obj_set_style_text_font(g_pin_dots, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(g_pin_dots, C_TEAL, 0);
+  lv_obj_align(g_pin_dots, LV_ALIGN_TOP_MID, 0, 52);
+  pinUpdateDots();
+
+  // 3x4 keypad
+  static const char* keys[12] = {"1","2","3","4","5","6","7","8","9",
+                                 LV_SYMBOL_BACKSPACE,"0",LV_SYMBOL_OK};
+  static const int vals[12] = {1,2,3,4,5,6,7,8,9,-1,0,-2};
+  const int kw = 104, kh = 74, gx = (LCD_WIDTH - kw * 3 - 16) / 2;
+  for (int i = 0; i < 12; ++i) {
+    lv_obj_t* b = lv_button_create(g_pin_scr);
+    lv_obj_set_size(b, kw, kh);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_set_style_bg_color(b, vals[i] == -2 ? lv_color_hex(0x0E3A20) : C_CARD, 0);
+    lv_obj_set_style_bg_color(b, C_CARD_HI, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_pos(b, gx + (i % 3) * (kw + 8), 96 + (i / 3) * (kh + 8));
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, keys[i]);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(l, vals[i] == -2 ? C_GREEN : C_TEXT, 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, pinKey, LV_EVENT_CLICKED, (void*)(uintptr_t)vals[i]);
+  }
+  lv_screen_load(g_pin_scr);
+}
+
+static void pinDone() {
+  if (g_pin_mode == 0) {  // unlock
+    if (keystore::unlock(g_pin_buf)) {
+      g_pin_buf = "";
+      g_home_stale = true;
+      gotoHome();
+      toast("Unlocked", 0x0E3A20);
+    } else {
+      g_pin_buf = "";
+      pinUpdateDots();
+      lv_label_set_text(g_pin_title, "Wrong PIN - try again");
+      lv_obj_set_style_text_color(g_pin_title, C_RED, 0);
+    }
+  } else if (g_pin_mode == 1) {  // set: first entry
+    g_pin_first = g_pin_buf;
+    buildPinPad("Confirm new PIN", 2);
+  } else {  // set: confirm
+    if (g_pin_buf == g_pin_first) {
+      const bool ok = keystore::setPin(g_pin_buf);
+      toast(ok ? "PIN set - keys encrypted" : "Failed to set PIN",
+            ok ? 0x0E3A20 : 0x59201C);
+      gotoHome();
+    } else {
+      buildPinPad("PINs differ - start over", 1);
+      lv_obj_set_style_text_color(g_pin_title, C_RED, 0);
+    }
+    g_pin_first = "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dice-entropy key ceremony
+// ---------------------------------------------------------------------------
+// Verifiable: key = SHA-256(ASCII digits of all rolls, e.g. "35142..."). The
+// user can replay the same rolls through sha256sum offline and compare npubs.
+// 100 rolls x log2(6) = 258 bits > 256: full-strength when honest dice.
+static lv_obj_t* g_dice_scr = nullptr;
+static lv_obj_t* g_dice_count = nullptr;
+static lv_obj_t* g_dice_warn = nullptr;
+static String g_dice_rolls;
+static int g_dice_repeat = 0;
+static char g_dice_last = 0;
+static constexpr int DICE_MIN = 100;
+
+static void diceFinish() {
+  uint8_t ent[32];
+  mbedtls_sha256((const unsigned char*)g_dice_rolls.c_str(),
+                 g_dice_rolls.length(), ent, 0);
+  int r = keystore::addFromEntropy(ent, "dice key");
+  memset(ent, 0, sizeof(ent));
+  g_dice_rolls = "";
+  if (r >= 0) {
+    keystore::setActive(r);
+    toast("Dice key created", 0x0E3A20);
+  } else {
+    toast(r == -4 ? "Store full (8 max)" : "Key create failed", 0x59201C);
+  }
+  g_home_stale = true;
+  gotoHome();
+}
+
+static void diceKey(lv_event_t* e) {
+  const int k = (int)(uintptr_t)lv_event_get_user_data(e);
+  if (k == -2) {  // done
+    if ((int)g_dice_rolls.length() >= DICE_MIN) diceFinish();
+    return;
+  }
+  if (k == -1) {  // cancel
+    g_dice_rolls = "";
+    gotoAccounts();
+    return;
+  }
+  const char c = (char)('0' + k);
+  if (c == g_dice_last) g_dice_repeat++;
+  else { g_dice_last = c; g_dice_repeat = 1; }
+  g_dice_rolls += c;
+
+  const int n = g_dice_rolls.length();
+  const int bits = (int)(n * 2.585f);
+  String s = String(n) + " rolls  -  ~" + String(bits > 256 ? 256 : bits) + " bits";
+  if (n >= DICE_MIN) s += "  -  ready";
+  lv_label_set_text(g_dice_count, s.c_str());
+  // Weak-entropy nudge: same face 4+ times in a row is legal but suspicious.
+  lv_label_set_text(g_dice_warn,
+                    g_dice_repeat >= 4 ? "Same number repeating - real dice?" : "");
+}
+
+static void buildDice() {
+  if (!g_dice_scr) g_dice_scr = makeScreen();
+  lv_obj_clean(g_dice_scr);
+  g_dice_rolls = "";
+  g_dice_repeat = 0;
+  g_dice_last = 0;
+
+  lv_obj_t* t = lv_label_create(g_dice_scr);
+  lv_label_set_text(t, "Roll a die, tap each result");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(t, C_TEXT, 0);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
+
+  g_dice_count = lv_label_create(g_dice_scr);
+  lv_label_set_text(g_dice_count, ("0 rolls  -  need " + String(DICE_MIN)).c_str());
+  lv_obj_set_style_text_font(g_dice_count, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(g_dice_count, C_DIM, 0);
+  lv_obj_align(g_dice_count, LV_ALIGN_TOP_MID, 0, 44);
+
+  g_dice_warn = lv_label_create(g_dice_scr);
+  lv_label_set_text(g_dice_warn, "");
+  lv_obj_set_style_text_font(g_dice_warn, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(g_dice_warn, C_AMBER, 0);
+  lv_obj_align(g_dice_warn, LV_ALIGN_TOP_MID, 0, 66);
+
+  // Dice faces 1-6 in a 3x2 grid, then cancel / done
+  const int kw = 104, kh = 84, gx = (LCD_WIDTH - kw * 3 - 16) / 2;
+  for (int i = 0; i < 6; ++i) {
+    lv_obj_t* b = lv_button_create(g_dice_scr);
+    lv_obj_set_size(b, kw, kh);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_set_style_bg_color(b, C_CARD, 0);
+    lv_obj_set_style_bg_color(b, C_CARD_HI, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_pos(b, gx + (i % 3) * (kw + 8), 92 + (i / 3) * (kh + 8));
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, String(i + 1).c_str());
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(l, C_TEXT, 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, diceKey, LV_EVENT_CLICKED, (void*)(uintptr_t)(i + 1));
+  }
+  lv_obj_t* cancel = roundIconBtn(g_dice_scr, LV_SYMBOL_CLOSE, 72,
+                                  lv_color_hex(0x451512), C_RED, diceKey,
+                                  (void*)(uintptr_t)-1);
+  lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -70, -22);
+  lv_obj_t* done = roundIconBtn(g_dice_scr, LV_SYMBOL_OK, 72,
+                                lv_color_hex(0x0E3A20), C_GREEN, diceKey,
+                                (void*)(uintptr_t)-2);
+  lv_obj_align(done, LV_ALIGN_BOTTOM_MID, 70, -22);
+
+  lv_screen_load_anim(g_dice_scr, LV_SCR_LOAD_ANIM_OVER_LEFT, 220, 0, false);
+}
+
+// ---------------------------------------------------------------------------
+// Wallet backup viewer (24 words on-screen only; never over the wire)
+// ---------------------------------------------------------------------------
+static lv_obj_t* g_backup_scr = nullptr;
+
+static void showBackup(int idx) {
+  uint8_t priv[32];
+  if (!keystore::privOf(idx, priv)) {
+    toast(keystore::locked() ? "Unlock first" : "No key", 0x59201C);
+    return;
+  }
+  String words = bip39::toMnemonic(priv);
+  memset(priv, 0, sizeof(priv));
+
+  if (!g_backup_scr) g_backup_scr = makeScreen();
+  lv_obj_clean(g_backup_scr);
+
+  lv_obj_t* t = lv_label_create(g_backup_scr);
+  lv_label_set_text(t, "Wallet backup");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(t, C_TEXT, 0);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
+
+  lv_obj_t* warn = lv_label_create(g_backup_scr);
+  lv_label_set_text(warn, "Write these 24 words down. Anyone\nwho sees them owns this key.");
+  lv_obj_set_style_text_font(warn, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(warn, C_AMBER, 0);
+  lv_obj_set_style_text_align(warn, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 42);
+
+  // Numbered words, 2 columns x 12 rows, scrollable if needed
+  lv_obj_t* grid = lv_obj_create(g_backup_scr);
+  lv_obj_set_pos(grid, 10, 86);
+  lv_obj_set_size(grid, LCD_WIDTH - 20, LCD_HEIGHT - 86 - 78);
+  lv_obj_set_style_bg_color(grid, C_CARD, 0);
+  lv_obj_set_style_radius(grid, 16, 0);
+  lv_obj_set_style_border_width(grid, 0, 0);
+  lv_obj_set_style_pad_all(grid, 12, 0);
+  lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_AUTO);
+  String left, right;
+  int wi = 0, start = 0;
+  for (int i = 0; i <= (int)words.length(); ++i) {
+    if (i == (int)words.length() || words[i] == ' ') {
+      String w = words.substring(start, i);
+      start = i + 1;
+      wi++;
+      String line = String(wi) + ". " + w + "\n";
+      if (wi <= 12) left += line; else right += line;
+    }
+  }
+  lv_obj_t* lc = lv_label_create(grid);
+  lv_label_set_text(lc, left.c_str());
+  lv_obj_set_style_text_font(lc, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lc, C_TEXT, 0);
+  lv_obj_set_style_text_line_space(lc, 6, 0);
+  lv_obj_align(lc, LV_ALIGN_TOP_LEFT, 4, 0);
+  lv_obj_t* rc = lv_label_create(grid);
+  lv_label_set_text(rc, right.c_str());
+  lv_obj_set_style_text_font(rc, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(rc, C_TEXT, 0);
+  lv_obj_set_style_text_line_space(rc, 6, 0);
+  lv_obj_align(rc, LV_ALIGN_TOP_LEFT, (LCD_WIDTH - 20) / 2, 0);
+
+  lv_obj_t* done = roundIconBtn(g_backup_scr, LV_SYMBOL_OK, 64, C_CARD, C_TEXT,
+      [](lv_event_t*) {
+        // Wipe the labels before leaving the screen.
+        lv_obj_clean(g_backup_scr);
+        gotoAccounts();
+      }, NULL);
+  lv_obj_align(done, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+  words = "";
+  lv_screen_load_anim(g_backup_scr, LV_SCR_LOAD_ANIM_OVER_LEFT, 220, 0, false);
+}
+
+// ---------------------------------------------------------------------------
+// Settings screen
+// ---------------------------------------------------------------------------
+static lv_obj_t* g_rot_chips[3] = {nullptr, nullptr, nullptr};
+static lv_obj_t* g_reset_modal = nullptr;
+
+static void styleRotChips() {
+  for (int i = 0; i < 3; ++i) {
+    if (!g_rot_chips[i]) continue;
+    const bool on = (rotationMode() == i);
+    lv_obj_set_style_bg_color(g_rot_chips[i], on ? C_BLUE : C_CARD_HI, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(g_rot_chips[i], 0),
+                                on ? C_TEXT : C_DIM, 0);
+  }
+}
+
+static void openResetModal() {
+  if (g_reset_modal) return;
+  g_reset_modal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(g_reset_modal, LCD_WIDTH, LCD_HEIGHT);
+  lv_obj_set_pos(g_reset_modal, 0, 0);
+  lv_obj_set_style_bg_color(g_reset_modal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(g_reset_modal, LV_OPA_80, 0);
+  lv_obj_set_style_border_width(g_reset_modal, 0, 0);
+  lv_obj_set_style_radius(g_reset_modal, 0, 0);
+  lv_obj_clear_flag(g_reset_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* card = lv_obj_create(g_reset_modal);
+  lv_obj_set_size(card, LCD_WIDTH - 48, 250);
+  lv_obj_center(card);
+  lv_obj_set_style_bg_color(card, C_CARD, 0);
+  lv_obj_set_style_radius(card, 22, 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* t = lv_label_create(card);
+  lv_label_set_text(t, "Erase ALL keys?");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(t, C_RED, 0);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 8);
+
+  lv_obj_t* w = lv_label_create(card);
+  lv_label_set_text(w, "Every account on this device\nwill be destroyed. Only a\nbackup can restore them.");
+  lv_obj_set_style_text_font(w, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(w, C_DIM, 0);
+  lv_obj_set_style_text_align(w, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(w, LV_ALIGN_TOP_MID, 0, 52);
+
+  lv_obj_t* no = roundIconBtn(card, LV_SYMBOL_CLOSE, 66, C_CARD_HI, C_TEXT,
+      [](lv_event_t*) {
+        if (g_reset_modal) { lv_obj_delete(g_reset_modal); g_reset_modal = nullptr; }
+      }, NULL);
+  lv_obj_align(no, LV_ALIGN_BOTTOM_MID, -60, -10);
+  lv_obj_t* yes = roundIconBtn(card, LV_SYMBOL_TRASH, 66, lv_color_hex(0x451512), C_RED,
+      [](lv_event_t*) {
+        while (keystore::count() > 0) keystore::removeKey(0);
+        if (g_reset_modal) { lv_obj_delete(g_reset_modal); g_reset_modal = nullptr; }
+        toast("All keys erased", 0x59201C);
+        g_home_stale = true;
+        gotoHome();
+      }, NULL);
+  lv_obj_align(yes, LV_ALIGN_BOTTOM_MID, 60, -10);
+}
+
+static void buildSettings() {
+  lv_obj_clean(scr_settings);
+  lv_obj_t* s = scr_settings;
+
+  lv_obj_t* back = roundIconBtn(s, LV_SYMBOL_LEFT, 44, C_CARD, C_TEXT,
+                                [](lv_event_t*) { gotoHome(); }, NULL);
+  lv_obj_set_pos(back, 12, 12);
+
+  lv_obj_t* title = lv_label_create(s);
+  lv_label_set_text(title, "Settings");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(title, C_TEXT, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 22);
+
+  // Scrollable content
+  lv_obj_t* list = lv_obj_create(s);
+  lv_obj_set_pos(list, 0, 66);
+  lv_obj_set_size(list, LCD_WIDTH, LCD_HEIGHT - 66);
+  lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_style_pad_hor(list, 14, 0);
+  lv_obj_set_style_pad_row(list, 10, 0);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+  auto sectionLbl = [&](const char* txt) {
+    lv_obj_t* l = lv_label_create(list);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, C_DIM, 0);
+    lv_obj_set_style_pad_top(l, 6, 0);
+    return l;
+  };
+  auto card = [&](int h) {
+    lv_obj_t* c = lv_obj_create(list);
+    lv_obj_set_size(c, LCD_WIDTH - 28, h);
+    lv_obj_set_style_bg_color(c, C_CARD, 0);
+    lv_obj_set_style_radius(c, 18, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_pad_all(c, 14, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    return c;
+  };
+
+  // --- Orientation ---
+  sectionLbl("ORIENTATION");
+  lv_obj_t* rc = card(96);
+  static const char* rot_names[3] = {"Auto", "USB down", "USB up"};
+  for (int i = 0; i < 3; ++i) {
+    lv_obj_t* chip = lv_button_create(rc);
+    lv_obj_set_size(chip, 96, 44);
+    lv_obj_set_style_radius(chip, 22, 0);
+    lv_obj_set_style_shadow_width(chip, 0, 0);
+    lv_obj_set_pos(chip, i * 102, 12);
+    lv_obj_t* cl = lv_label_create(chip);
+    lv_label_set_text(cl, rot_names[i]);
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+    lv_obj_center(cl);
+    g_rot_chips[i] = chip;
+    lv_obj_add_event_cb(chip, [](lv_event_t* e) {
+      const uint8_t m = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+      setRotationMode(m);
+      if (g_cb.setRotation) g_cb.setRotation(m);
+      styleRotChips();
+    }, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+  }
+  styleRotChips();
+
+  // --- Connect (bridge URL + QR) ---
+  sectionLbl("CONNECT FROM YOUR PHONE");
+  lv_obj_t* bc = card(300);
+  lv_obj_t* burl = lv_label_create(bc);
+  lv_label_set_text(burl, "http://10.77.7.1/bridge");
+  lv_obj_set_style_text_font(burl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(burl, C_TEAL, 0);
+  lv_obj_align(burl, LV_ALIGN_TOP_MID, 0, 0);
+  if (g_qr_buf) {
+    lv_obj_t* cv = lv_canvas_create(bc);
+    lv_canvas_set_buffer(cv, g_qr_buf, QR_CANVAS, QR_CANVAS, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(cv, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_radius(cv, 10, 0);
+    lv_obj_set_style_clip_corner(cv, true, 0);
+    drawQr(cv, "http://10.77.7.1/bridge");
+  }
+
+  // --- Storage / about ---
+  sectionLbl("DEVICE");
+  lv_obj_t* dc = card(110);
+  lv_obj_t* info = lv_label_create(dc);
+  const uint32_t heap_kb = esp_get_free_heap_size() / 1024;
+  const uint32_t psram_kb = ESP.getFreePsram() / 1024;
+  String is = "Keys: " + String(keystore::count()) + " / " + String(keystore::MAX_KEYS);
+  is += "\nFree RAM: " + String(heap_kb) + " KB   PSRAM: " + String(psram_kb) + " KB";
+  is += "\nFirmware: " __DATE__;
+  lv_label_set_text(info, is.c_str());
+  lv_obj_set_style_text_font(info, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(info, C_DIM, 0);
+  lv_obj_align(info, LV_ALIGN_LEFT_MID, 0, 0);
+
+  // --- Security ---
+  sectionLbl("SECURITY");
+  lv_obj_t* sec = card(72);
+  lv_obj_t* pb = lv_button_create(sec);
+  lv_obj_set_size(pb, LCD_WIDTH - 84, 44);
+  lv_obj_set_style_radius(pb, 22, 0);
+  lv_obj_set_style_bg_color(pb, C_CARD_HI, 0);
+  lv_obj_set_style_shadow_width(pb, 0, 0);
+  lv_obj_center(pb);
+  lv_obj_t* pl = lv_label_create(pb);
+  lv_label_set_text(pl, keystore::pinSet() ? "Change PIN / remove"
+                                           : "Set device PIN (encrypts keys)");
+  lv_obj_set_style_text_font(pl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(pl, C_TEXT, 0);
+  lv_obj_center(pl);
+  lv_obj_add_event_cb(pb, [](lv_event_t*) {
+    if (keystore::pinSet()) {
+      // Change/remove: simple chooser
+      if (g_reset_modal) return;
+      g_reset_modal = lv_obj_create(lv_layer_top());
+      lv_obj_set_size(g_reset_modal, LCD_WIDTH, LCD_HEIGHT);
+      lv_obj_set_style_bg_color(g_reset_modal, lv_color_hex(0x000000), 0);
+      lv_obj_set_style_bg_opa(g_reset_modal, LV_OPA_80, 0);
+      lv_obj_set_style_border_width(g_reset_modal, 0, 0);
+      lv_obj_clear_flag(g_reset_modal, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_t* card2 = lv_obj_create(g_reset_modal);
+      lv_obj_set_size(card2, LCD_WIDTH - 56, LV_SIZE_CONTENT);
+      lv_obj_set_style_radius(card2, 24, 0);
+      lv_obj_set_style_bg_color(card2, C_CARD, 0);
+      lv_obj_set_style_border_width(card2, 0, 0);
+      lv_obj_set_style_pad_all(card2, 20, 0);
+      lv_obj_center(card2);
+      lv_obj_set_flex_flow(card2, LV_FLEX_FLOW_COLUMN);
+      lv_obj_set_style_pad_row(card2, 10, 0);
+      auto opt2 = [&](const char* txt, lv_event_cb_t ocb) {
+        lv_obj_t* b = lv_button_create(card2);
+        lv_obj_set_size(b, lv_pct(100), 52);
+        lv_obj_set_style_radius(b, 18, 0);
+        lv_obj_set_style_bg_color(b, C_CARD_HI, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_t* l = lv_label_create(b);
+        lv_label_set_text(l, txt);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, C_TEXT, 0);
+        lv_obj_center(l);
+        lv_obj_add_event_cb(b, ocb, LV_EVENT_CLICKED, NULL);
+      };
+      opt2("Change PIN", [](lv_event_t*) {
+        lv_obj_delete(g_reset_modal); g_reset_modal = nullptr;
+        buildPinPad("Enter new PIN (4-8 digits)", 1);
+      });
+      opt2("Remove PIN (plaintext keys)", [](lv_event_t*) {
+        lv_obj_delete(g_reset_modal); g_reset_modal = nullptr;
+        const bool ok = keystore::clearPin();
+        toast(ok ? "PIN removed" : "Failed", ok ? 0x3B2A0A : 0x59201C);
+        gotoHome();
+      });
+      opt2("Cancel", [](lv_event_t*) {
+        lv_obj_delete(g_reset_modal); g_reset_modal = nullptr;
+      });
+    } else {
+      buildPinPad("Enter new PIN (4-8 digits)", 1);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  // --- Danger zone ---
+  sectionLbl("DANGER ZONE");
+  lv_obj_t* rz = card(72);
+  lv_obj_t* rb = lv_button_create(rz);
+  lv_obj_set_size(rb, LCD_WIDTH - 84, 44);
+  lv_obj_set_style_radius(rb, 22, 0);
+  lv_obj_set_style_bg_color(rb, lv_color_hex(0x451512), 0);
+  lv_obj_set_style_shadow_width(rb, 0, 0);
+  lv_obj_center(rb);
+  lv_obj_t* rl = lv_label_create(rb);
+  lv_label_set_text(rl, "Erase all keys");
+  lv_obj_set_style_text_color(rl, C_RED, 0);
+  lv_obj_set_style_text_font(rl, &lv_font_montserrat_16, 0);
+  lv_obj_center(rl);
+  lv_obj_add_event_cb(rb, [](lv_event_t*) { openResetModal(); }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t* pad = lv_label_create(list);  // bottom breathing room
+  lv_label_set_text(pad, "");
+  lv_obj_set_height(pad, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Rotation (IMU auto / manual lock)
+// ---------------------------------------------------------------------------
+static uint8_t g_rot_mode = ROT_AUTO;
+static uint32_t g_grav_since = 0;   // when gravity started pointing the other way
+static bool g_grav_want = false;    // orientation gravity is asking for
+
+static void applyRot(bool rot180) {
+  if (g_rot180 == rot180) return;
+  g_rot180 = rot180;
+  lv_obj_invalidate(lv_screen_active());
+}
+
+void setRotationMode(uint8_t mode) {
+  g_rot_mode = mode;
+  if (mode == ROT_USB_DOWN) applyRot(false);
+  else if (mode == ROT_USB_UP) applyRot(true);
+  // ROT_AUTO: next setGravityY() decides
+}
+
+uint8_t rotationMode() { return g_rot_mode; }
+
+void setGravityY(float g) {
+  if (g_rot_mode != ROT_AUTO) return;
+  // Never flip mid-decision: a signature approval must not have its buttons
+  // swap places under the user's thumb.
+  lv_obj_t* act = lv_screen_active();
+  if (act == scr_request) return;
+  // Hysteresis: require a clear reading (|g| > 0.5) held for 700ms.
+  if (fabsf(g) < 0.5f) { g_grav_since = 0; return; }
+  const bool want = (g < 0);  // USB edge up -> rotate 180
+  if (want == g_rot180) { g_grav_since = 0; return; }
+  const uint32_t now = millis();
+  if (g_grav_want != want || g_grav_since == 0) {
+    g_grav_want = want;
+    g_grav_since = now;
+    return;
+  }
+  if (now - g_grav_since >= 700) {
+    applyRot(want);
+    g_grav_since = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot splash
+// ---------------------------------------------------------------------------
+void showSplash() {
+  lv_obj_t* s = makeScreen();
+  // Placeholder mark until the final logo lands: a coin-and-bolt motif in the
+  // brand's colors (orange disc + purple bolt), matching the nostrtx icon.
+  lv_obj_t* disc = plainCont(s);
+  lv_obj_set_size(disc, 110, 110);
+  lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(disc, lv_color_hex(0xF7931A), 0);
+  lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+  lv_obj_align(disc, LV_ALIGN_CENTER, -14, -60);
+  lv_obj_t* b = lv_label_create(disc);
+  lv_label_set_text(b, "B");
+  lv_obj_set_style_text_font(b, &lv_font_montserrat_44, 0);
+  lv_obj_set_style_text_color(b, lv_color_hex(0x000000), 0);
+  lv_obj_center(b);
+  lv_obj_t* bolt = lv_label_create(s);
+  lv_label_set_text(bolt, LV_SYMBOL_CHARGE);
+  lv_obj_set_style_text_font(bolt, &lv_font_montserrat_44, 0);
+  lv_obj_set_style_text_color(bolt, lv_color_hex(0xBF5AF2), 0);
+  lv_obj_align(bolt, LV_ALIGN_CENTER, 52, -60);
+
+  lv_obj_t* name = lv_label_create(s);
+  lv_label_set_text(name, "Nostr Onchain");
+  lv_obj_set_style_text_font(name, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(name, C_TEXT, 0);
+  lv_obj_align(name, LV_ALIGN_CENTER, 0, 28);
+
+  lv_obj_t* sub = lv_label_create(s);
+  lv_label_set_text(sub, "Pocket Signer");
+  lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(sub, C_DIM, 0);
+  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 60);
+
+  lv_screen_load(s);
+  // Render it now (init() runs before the main loop starts ticking LVGL),
+  // hold briefly, then fall through to unlock (PIN set) or home.
+  for (int i = 0; i < 30; ++i) { lv_timer_handler(); delay(16); }
+  delay(600);
+  if (keystore::locked()) {
+    buildPinPad("Enter PIN", 0);
+  } else {
+    lv_screen_load_anim(scr_home, LV_SCR_LOAD_ANIM_FADE_IN, 350, 0, true);
+  }
+}
+
 void init(Arduino_GFX* gfx, Arduino_IIC* touch, const UiCallbacks& cb,
           bool auto_auth) {
   g_gfx = gfx;
@@ -1680,6 +2408,7 @@ void init(Arduino_GFX* gfx, Arduino_IIC* touch, const UiCallbacks& cb,
   lv_indev_set_read_cb(indev, touch_read_cb);
 
   scr_home = makeScreen();
+  scr_settings = makeScreen();
   scr_accounts = makeScreen();
   scr_request = makeScreen();
   scr_result = makeScreen();

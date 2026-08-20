@@ -14,7 +14,11 @@ struct UiCallbacks {
   void (*exportSD)();
   void (*signPsbtSD)();             // load /unsigned.psbt from the SD card
   void (*setAutoAuth)(bool on);
+  void (*setRotation)(uint8_t mode);  // persist rotation mode (see ROT_*)
 };
+
+// Rotation modes (Settings > Orientation)
+enum : uint8_t { ROT_AUTO = 0, ROT_USB_DOWN = 1, ROT_USB_UP = 2 };
 
 namespace ui {
 
@@ -45,5 +49,16 @@ void buttonShort();
 void buttonLong();
 
 void toggleByteSwap();  // serial 'W': flip RGB565 byte order if colors look off
+
+// --- rotation / boot ---------------------------------------------------------
+// Boot splash: logo mark + name, shown before the home screen.
+void showSplash();
+// Apply a rotation mode. For ROT_AUTO the sketch feeds gravity via setGravityY.
+void setRotationMode(uint8_t mode);
+uint8_t rotationMode();
+// IMU gravity along the screen's long axis, positive = USB-C edge down.
+// Called by the sketch at a few Hz; ui applies hysteresis and never flips
+// while a signing request or PSBT review is on screen.
+void setGravityY(float g);
 
 }  // namespace ui

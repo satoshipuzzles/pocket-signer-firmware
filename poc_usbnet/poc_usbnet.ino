@@ -31,6 +31,9 @@
 #include <mbedtls/base64.h>
 
 #include <Arduino_GFX_Library.h>
+#include <SensorQMI8658.hpp>
+#define XPOWERS_CHIP_AXP2101
+#include <XPowersLib.h>
 #include <Arduino_DriveBus_Library.h>
 #include <Adafruit_XCA9554.h>
 
@@ -60,6 +63,10 @@ Arduino_CO5300* gfx = new Arduino_CO5300(
 
 Adafruit_XCA9554 expander;
 static bool touch_ok = false;
+static SensorQMI8658 qmi;
+static bool g_imu_ok = false;
+static XPowersAXP2101 pmu;
+static bool g_pmu_ok = false;
 
 std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
     std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
@@ -529,6 +536,14 @@ static void persistAutoAuth(bool on) {
   Preferences pr;
   if (pr.begin("nostr", false)) {
     pr.putUChar("autoauth", on ? 1 : 0);
+    pr.end();
+  }
+}
+
+static void persistRotation(uint8_t mode) {
+  Preferences pr;
+  if (pr.begin("nostr", false)) {
+    pr.putUChar("rot", mode);
     pr.end();
   }
 }
@@ -1131,13 +1146,35 @@ void setup() {
   keystore::begin();
   profile::begin();
 
+  uint8_t rot_mode = ROT_AUTO;
   {
     Preferences pr;
     if (pr.begin("nostr", false)) {
       g_auto_auth = pr.getUChar("autoauth", 1) != 0;
+      rot_mode = pr.getUChar("rot", ROT_AUTO);
       pr.end();
     }
   }
+
+  // IMU (QMI8658 on the shared I2C bus) for auto-rotation.
+  g_imu_ok = qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
+  if (!g_imu_ok) g_imu_ok = qmi.begin(Wire, QMI8658_H_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
+  if (g_imu_ok) {
+    qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
+                            SensorQMI8658::ACC_ODR_125Hz,
+                            SensorQMI8658::LPF_MODE_0);
+    qmi.enableAccelerometer();
+  }
+  Serial.printf("[poc] imu %s\n", g_imu_ok ? "ok" : "UNAVAILABLE");
+
+  // PMU (AXP2101): the second physical button (PWR) reaches us as PEK IRQs.
+  g_pmu_ok = pmu.init(Wire, IIC_SDA, IIC_SCL, AXP2101_SLAVE_ADDRESS);
+  if (g_pmu_ok) {
+    pmu.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
+    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
+    pmu.clearIrqStatus();
+  }
+  Serial.printf("[poc] pmu %s\n", g_pmu_ok ? "ok" : "UNAVAILABLE");
 
   UiCallbacks cb;
   cb.decide = onDecide;
@@ -1146,7 +1183,10 @@ void setup() {
   cb.exportSD = exportToSD;
   cb.signPsbtSD = signPsbtFromSD;
   cb.setAutoAuth = persistAutoAuth;
+  cb.setRotation = persistRotation;
   ui::init(gfx, CST.get(), cb, g_auto_auth);
+  ui::setRotationMode(rot_mode);
+  ui::showSplash();
 
   if (!usbnet::begin()) {
     Serial.println("[poc] usbnet begin FAILED");
@@ -1197,6 +1237,31 @@ void loop() {
   }
 
   ui::setLink(usbnet::linkUp());
+
+  // Second physical button (PWR on the AXP2101): short press = select /
+  // confirm (same as BOOT long-hold), long press = back. Together with BOOT
+  // (click = move focus) that gives: left button navigate, right button select.
+  static uint32_t pmu_t = 0;
+  if (g_pmu_ok && now - pmu_t > 50) {
+    pmu_t = now;
+    pmu.getIrqStatus();
+    // Short press = select/confirm (ui::buttonLong carries the existing
+    // confirm-or-back semantics per screen). Long press is left to the PMU's
+    // hardware power-off so the user can always hard-cut a wedged device.
+    if (pmu.isPekeyShortPressIrq()) ui::buttonLong();
+    pmu.clearIrqStatus();
+  }
+
+  // Auto-rotation: sample gravity ~5 Hz. Y axis runs along the screen's long
+  // side on this board; ui applies hysteresis + never flips mid-signing.
+  static uint32_t imu_t = 0;
+  if (g_imu_ok && now - imu_t > 200) {
+    imu_t = now;
+    if (qmi.getDataReady()) {
+      float ax, ay, az;
+      if (qmi.getAccelerometer(ax, ay, az)) ui::setGravityY(ay);
+    }
+  }
 
   // A pending Bitcoin tx expires after 5 minutes unattended.
   if (g_pstate == PS_PENDING && now - g_ptx_born > 300000) {

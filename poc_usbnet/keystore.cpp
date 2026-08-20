@@ -1,5 +1,6 @@
 #include "keystore.h"
 #include "bech32.h"
+#include "keywrap.h"
 
 #include <Preferences.h>
 #include <esp_random.h>
@@ -19,6 +20,12 @@ struct Slot {
 static Slot s_keys[MAX_KEYS];
 static int s_count = 0;
 static int s_active = 0;
+
+// PIN state. When a PIN is set, NVS holds wrapped blobs ("k{i}w", 60B) instead
+// of raw "k{i}p"; s_keys[].priv is only populated after unlock().
+static bool s_pin_set = false;
+static bool s_locked = false;
+static uint8_t s_wrap_key[32];  // in RAM after unlock; zeroized on clearPin
 
 // ---------------------------------------------------------------------------
 // secp256k1 helpers (same conventions as the Signer app's nostr_keys.cpp)
@@ -73,23 +80,36 @@ static void slotKeys(int i, char p[8], char x[8], char l[8]) {
   snprintf(l, 8, "k%dl", i);
 }
 
+static void wrapSlotKey(int i, char w[8]) { snprintf(w, 8, "k%dw", i); }
+
 static bool persistAll() {
   Preferences pr;
   if (!pr.begin(kNs, false)) return false;
   pr.putUChar("n", (uint8_t)s_count);
   pr.putUChar("act", (uint8_t)s_active);
   for (int i = 0; i < s_count; ++i) {
-    char kp[8], kx[8], kl[8];
+    char kp[8], kx[8], kl[8], kw[8];
     slotKeys(i, kp, kx, kl);
-    pr.putBytes(kp, s_keys[i].priv, 32);
+    wrapSlotKey(i, kw);
+    if (s_pin_set) {
+      // Encrypted at rest: wrapped blob only, never the raw private key.
+      uint8_t blob[keywrap::BLOB_LEN];
+      keywrap::wrap(s_wrap_key, s_keys[i].priv, blob);
+      pr.putBytes(kw, blob, sizeof(blob));
+      pr.remove(kp);
+    } else {
+      pr.putBytes(kp, s_keys[i].priv, 32);
+      pr.remove(kw);
+    }
     pr.putBytes(kx, s_keys[i].pub_x, 32);
     pr.putString(kl, s_keys[i].label);
   }
   // clear any stale higher slots
   for (int i = s_count; i < MAX_KEYS; ++i) {
-    char kp[8], kx[8], kl[8];
+    char kp[8], kx[8], kl[8], kw[8];
     slotKeys(i, kp, kx, kl);
-    pr.remove(kp); pr.remove(kx); pr.remove(kl);
+    wrapSlotKey(i, kw);
+    pr.remove(kp); pr.remove(kx); pr.remove(kl); pr.remove(kw);
   }
   pr.end();
   return true;
@@ -102,15 +122,24 @@ bool begin() {
   s_count = pr.getUChar("n", 0);
   s_active = pr.getUChar("act", 0);
   if (s_count > MAX_KEYS) s_count = MAX_KEYS;
+  s_pin_set = pr.getBytesLength("pinsalt") == 16;
+  s_locked = s_pin_set;
 
   for (int i = 0; i < s_count; ++i) {
-    char kp[8], kx[8], kl[8];
+    char kp[8], kx[8], kl[8], kw[8];
     slotKeys(i, kp, kx, kl);
-    if (pr.getBytesLength(kp) != 32 || pr.getBytesLength(kx) != 32) {
+    wrapSlotKey(i, kw);
+    const bool has_plain = pr.getBytesLength(kp) == 32;
+    const bool has_wrap = pr.getBytesLength(kw) == keywrap::BLOB_LEN;
+    if (pr.getBytesLength(kx) != 32 || (!has_plain && !has_wrap)) {
       s_count = i;
       break;
     }
-    pr.getBytes(kp, s_keys[i].priv, 32);
+    if (s_pin_set && has_wrap) {
+      memset(s_keys[i].priv, 0, 32);  // decrypted on unlock()
+    } else {
+      pr.getBytes(kp, s_keys[i].priv, 32);
+    }
     pr.getBytes(kx, s_keys[i].pub_x, 32);
     s_keys[i].label = pr.getString(kl, "key " + String(i + 1));
   }
@@ -175,6 +204,7 @@ String npubOf(int idx) {
 
 bool privOf(int idx, uint8_t out[32]) {
   if (idx < 0 || idx >= s_count) return false;
+  if (s_locked) return false;  // no signing before unlock
   memcpy(out, s_keys[idx].priv, 32);
   return true;
 }
@@ -236,6 +266,97 @@ int generateKey(const String& label) {
   int r = addSlot(priv, label);
   memset(priv, 0, 32);
   return r;
+}
+
+int addFromEntropy(const uint8_t entropy[32], const String& label) {
+  // Deliberately NOT mixed with esp_random: the point of the dice ceremony is
+  // that the user can re-derive this key offline and verify the device didn't
+  // cheat. key = entropy (canonicalized to a valid even-Y secp256k1 scalar).
+  uint8_t priv[32];
+  memcpy(priv, entropy, 32);
+  int r = addSlot(priv, label);
+  memset(priv, 0, 32);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// PIN encryption
+// ---------------------------------------------------------------------------
+bool pinSet() { return s_pin_set; }
+bool locked() { return s_locked; }
+
+bool unlock(const String& pin) {
+  if (!s_pin_set) return true;
+  Preferences pr;
+  if (!pr.begin(kNs, false)) return false;
+  uint8_t salt[16], want[32], got[32];
+  if (pr.getBytes("pinsalt", salt, 16) != 16 ||
+      pr.getBytes("pinver", want, 32) != 32) {
+    pr.end();
+    return false;
+  }
+  uint8_t key[32];
+  keywrap::deriveKey(pin, salt, key);
+  keywrap::verifier(key, salt, got);
+  if (memcmp(want, got, 32) != 0) {
+    memset(key, 0, sizeof(key));
+    pr.end();
+    return false;  // wrong PIN
+  }
+  // Decrypt every slot.
+  bool ok = true;
+  for (int i = 0; i < s_count; ++i) {
+    char kw[8];
+    wrapSlotKey(i, kw);
+    uint8_t blob[keywrap::BLOB_LEN];
+    if (pr.getBytes(kw, blob, sizeof(blob)) != sizeof(blob) ||
+        !keywrap::unwrap(key, blob, s_keys[i].priv)) {
+      ok = false;
+      break;
+    }
+  }
+  pr.end();
+  if (!ok) {
+    for (int i = 0; i < s_count; ++i) memset(s_keys[i].priv, 0, 32);
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+  memcpy(s_wrap_key, key, 32);
+  memset(key, 0, sizeof(key));
+  s_locked = false;
+  Serial.println("[keystore] unlocked");
+  return true;
+}
+
+bool setPin(const String& pin) {
+  if (s_locked) return false;
+  if (pin.length() < 4) return false;
+  uint8_t salt[16];
+  esp_fill_random(salt, 16);
+  keywrap::deriveKey(pin, salt, s_wrap_key);
+  uint8_t ver[32];
+  keywrap::verifier(s_wrap_key, salt, ver);
+  Preferences pr;
+  if (!pr.begin(kNs, false)) return false;
+  pr.putBytes("pinsalt", salt, 16);
+  pr.putBytes("pinver", ver, 32);
+  pr.end();
+  s_pin_set = true;
+  const bool ok = persistAll();  // rewrites slots wrapped, removes plaintext
+  Serial.printf("[keystore] PIN %s\n", ok ? "set - keys encrypted at rest" : "persist FAILED");
+  return ok;
+}
+
+bool clearPin() {
+  if (s_locked) return false;
+  Preferences pr;
+  if (!pr.begin(kNs, false)) return false;
+  pr.remove("pinsalt");
+  pr.remove("pinver");
+  pr.end();
+  s_pin_set = false;
+  memset(s_wrap_key, 0, sizeof(s_wrap_key));
+  return persistAll();  // rewrites slots plaintext, removes blobs
 }
 
 bool removeKey(int idx) {

@@ -43,7 +43,22 @@ int importKey(const String& raw, const String& label);
 // Generate a brand new key from hardware entropy. Same return convention.
 int generateKey(const String& label);
 
+// Add a key from raw 32 bytes of caller-supplied entropy (dice ceremony).
+// The bytes are used as the secret key directly (canonicalized) so the user
+// can independently re-derive and verify. Same return convention as import.
+int addFromEntropy(const uint8_t entropy[32], const String& label);
+
 // Remove a key (compacts the list, fixes the active index).
 bool removeKey(int idx);
+
+// --- PIN encryption ----------------------------------------------------------
+// With a PIN set, private keys are stored AES-256-GCM-wrapped under a key
+// derived from the PIN (PBKDF2, per-device salt). Until unlock() succeeds,
+// private keys are unavailable and all signing/mutation fails.
+bool pinSet();
+bool locked();
+bool unlock(const String& pin);        // false = wrong PIN
+bool setPin(const String& pin);        // set or change (requires unlocked)
+bool clearPin();                       // back to plaintext storage (unlocked only)
 
 } // namespace keystore
